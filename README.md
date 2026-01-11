@@ -1,6 +1,6 @@
 # SCORM 1.2 Generator Wizard v0.3
 
-![Alt text](/scorm-wizard-icon.ico?raw=true&sanitaze=true  "SCORM Generator Wizard v0.3 logo")
+![Alt text](/SCORM-GW-logo.webp?raw=true  "SCORM Generator Wizard v0.3 logo")
 
 A simple SCORM wrapper for Windows.
 Supported Host/Media: Vimeo, YouTube, Remote URL and local file (tested on .mp4)
