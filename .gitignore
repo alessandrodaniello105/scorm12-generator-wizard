@@ -1,0 +1,6 @@
+__pycache__/**
+.venv/**
+build/**
+dist/**
+scorm_wizard.py
+scorm_generator.py
