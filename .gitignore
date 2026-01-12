@@ -5,3 +5,4 @@ dist/**
 scorm_wizard.py
 scorm_generator.py
 SCORM-GW-v0.3-code+csv.zip
+template-csv2.csv
