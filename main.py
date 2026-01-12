@@ -10,6 +10,8 @@ from qt_material import apply_stylesheet
 
 from gui_main import SCORMWizard
 from logic import SCORMLogic
+import subprocess
+from pathlib import Path
 
 
 class GenerationWorker(QThread):
@@ -22,7 +24,7 @@ class GenerationWorker(QThread):
     error_occurred = Signal(str)
     
     def __init__(self, logic, title, description, video_type, video_url, 
-                 local_file, output_dir, output_filename=None):
+                 local_file, output_dir, output_filename=None, subtitle_file=None):
         super().__init__()
         self.logic = logic
         self.title = title
@@ -30,6 +32,7 @@ class GenerationWorker(QThread):
         self.video_type = video_type
         self.video_url = video_url
         self.local_file = local_file
+        self.subtitle_file = subtitle_file
         self.output_dir = output_dir
         self.output_filename = output_filename
     
@@ -45,6 +48,7 @@ class GenerationWorker(QThread):
                 video_type=self.video_type,
                 video_url=self.video_url,
                 local_video_file=self.local_file,
+                subtitle_file=self.subtitle_file,
                 output_dir=self.output_dir,
                 output_filename=self.output_filename
             )
@@ -70,15 +74,27 @@ class BatchWorker(QThread):
         self.output_dir = output_dir
         self.conflict_result = None
         self.conflict_waiting = False
+        self._cancelled = False
+        self.start_time = None
+    
+    def cancel(self):
+        """Cancel the batch processing."""
+        self._cancelled = True
     
     def run(self):
         """Esegue il processamento batch in background"""
         try:
+            import time
+            self.start_time = time.time()
+            
             # Connetti i signals della logica ai signals del worker
             self.logic.batch_progress_updated.connect(self.progress_updated.emit)
             
             # Crea conflict handler che emette un signal
             def conflict_handler(file_path, apply_to_all):
+                if self._cancelled:
+                    return 'cancel', None, None
+                    
                 self.conflict_waiting = True
                 self.conflict_result = None
                 self.conflict_detected.emit(file_path, apply_to_all)
@@ -86,11 +102,11 @@ class BatchWorker(QThread):
                 # Attendi la risposta (con timeout)
                 timeout_ms = 300000  # 5 minuti in millisecondi
                 elapsed = 0
-                while self.conflict_waiting and elapsed < timeout_ms:
+                while self.conflict_waiting and elapsed < timeout_ms and not self._cancelled:
                     self.msleep(100)  # 100ms
                     elapsed += 100
                 
-                if self.conflict_result is None:
+                if self._cancelled or self.conflict_result is None:
                     return 'cancel', None, None
                 
                 result = self.conflict_result
@@ -103,9 +119,11 @@ class BatchWorker(QThread):
                 conflict_handler=conflict_handler
             )
             
-            self.batch_complete.emit(processed, errors)
+            if not self._cancelled:
+                self.batch_complete.emit(processed, errors)
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            if not self._cancelled:
+                self.error_occurred.emit(str(e))
     
     def set_conflict_result(self, result):
         """Imposta il risultato del conflitto e sveglia il thread"""
@@ -147,7 +165,7 @@ class SCORMApplication:
         self.logic.error_occurred.connect(self.gui.show_error)
     
     def _handle_generate_request(self, title, description, video_type, 
-                                 video_input, local_file_path, output_dir):
+                                 video_input, local_file_path, subtitle_file_path, output_dir):
         """
         Gestisce la richiesta di generazione dalla GUI.
         Valida gli input e avvia la generazione.
@@ -201,6 +219,7 @@ class SCORMApplication:
             video_type=video_type,
             video_url=video_url,
             local_file=local_file,
+            subtitle_file=subtitle_file_path if subtitle_file_path else None,
             output_dir=output_dir,
             output_filename=output_filename
         )
@@ -234,6 +253,9 @@ class SCORMApplication:
         self.batch_worker.error_occurred.connect(self._on_batch_error)
         self.batch_worker.conflict_detected.connect(self._handle_batch_conflict)
         
+        # Connect cancel button
+        self.gui.on_cancel_batch = lambda: self.batch_worker.cancel()
+        
         # Avvia processamento
         self.batch_worker.start()
     
@@ -248,16 +270,66 @@ class SCORMApplication:
     def _on_package_generated(self, output_path):
         """Gestisce il completamento della generazione"""
         self.gui.set_generating_state(False)
+        
+        # Get file size for display
+        from pathlib import Path
+        file_size = Path(output_path).stat().st_size
+        size_mb = file_size / (1024 * 1024)
+        size_str = f"{size_mb:.2f} MB" if size_mb >= 1 else f"{file_size / 1024:.2f} KB"
+        
         self.gui.show_success(
-            f"SCORM package generated successfully!\n\nSaved to:\n{output_path}"
+            f"SCORM package generated successfully!\n\nSaved to:\n{output_path}\n\nSize: {size_str}",
+            output_path=output_path
         )
+        
+        # Auto-open folder if configured
+        if self.gui.config.get_auto_open_folder():
+            self.gui._open_output_folder(output_path)
     
     def _on_generation_error(self, error_msg):
-        """Gestisce errori durante la generazione"""
+        """Gestisce errori durante la generazione con messaggi migliorati"""
         self.gui.set_generating_state(False)
-        self.gui.show_error(f"Failed to generate SCORM package:\n{error_msg}")
+        
+        # Enhanced error message with suggestions
+        enhanced_msg = self._enhance_error_message(error_msg, "generation")
+        self.gui.show_error(enhanced_msg)
         import traceback
         traceback.print_exc()
+    
+    def _enhance_error_message(self, error_msg: str, context: str) -> str:
+        """Enhance error message with actionable suggestions."""
+        enhanced = f"Failed to {context}:\n\n{error_msg}\n\n"
+        
+        # Add suggestions based on error type
+        if "template" in error_msg.lower() or "not found" in error_msg.lower():
+            enhanced += "What went wrong?\n"
+            enhanced += "• Required template files are missing\n\n"
+            enhanced += "How to fix it?\n"
+            enhanced += "• Ensure 'working_scorm_zip_example' folder exists\n"
+            enhanced += "• Reinstall the application if the problem persists"
+        elif "permission" in error_msg.lower() or "access" in error_msg.lower():
+            enhanced += "What went wrong?\n"
+            enhanced += "• Cannot write to the output directory\n\n"
+            enhanced += "How to fix it?\n"
+            enhanced += "• Choose a different output directory\n"
+            enhanced += "• Check folder permissions\n"
+            enhanced += "• Close any programs using the output folder"
+        elif "video" in error_msg.lower() or "file" in error_msg.lower():
+            enhanced += "What went wrong?\n"
+            enhanced += "• Video file or URL is invalid\n\n"
+            enhanced += "How to fix it?\n"
+            enhanced += "• Verify the video file exists (for local files)\n"
+            enhanced += "• Check the video URL is accessible (for remote URLs)\n"
+            enhanced += "• Ensure video ID is correct (for Vimeo/YouTube)"
+        else:
+            enhanced += "What went wrong?\n"
+            enhanced += "• An unexpected error occurred\n\n"
+            enhanced += "How to fix it?\n"
+            enhanced += "• Check all input fields are valid\n"
+            enhanced += "• Try again with different inputs\n"
+            enhanced += "• Contact support if the problem persists"
+        
+        return enhanced
     
     def _on_batch_complete(self, processed, errors):
         """Gestisce il completamento del processamento batch"""
@@ -281,7 +353,8 @@ class SCORMApplication:
         """Gestisce errori durante il processamento batch"""
         self.gui.set_batch_processing_state(False)
         batch_window = getattr(self.gui, 'batch_window', None)
-        self.gui.show_error(f"Failed to process batch:\n{error_msg}", window=batch_window)
+        enhanced_msg = self._enhance_error_message(error_msg, "process batch")
+        self.gui.show_error(enhanced_msg, window=batch_window)
         import traceback
         traceback.print_exc()
     

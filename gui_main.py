@@ -8,9 +8,11 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, #type: ignore
                                 QRadioButton, QButtonGroup, QProgressBar, QMessageBox, 
                                 QFileDialog, QDialog, QFrame) #type: ignore
 from PySide6.QtCore import Qt, Signal, QThread #type: ignore
-from PySide6.QtGui import QFont, QIcon #type: ignore
+from PySide6.QtGui import QFont, QIcon, QKeySequence, QShortcut #type: ignore
 from PySide6.QtWidgets import QStyle #type: ignore
 import os
+import re
+from config import Config
 
 
 class SCORMWizard(QMainWindow):
@@ -19,13 +21,13 @@ class SCORMWizard(QMainWindow):
     Comunica con la logica tramite Signals.
     """
     # Signals emessi dalla GUI verso la logica
-    generate_requested = Signal(str, str, str, str, str, str)  # title, description, video_type, video_url, local_file, output_dir
+    generate_requested = Signal(str, str, str, str, str, str, str)  # title, description, video_type, video_url, local_file, subtitle_file, output_dir
     batch_process_requested = Signal(str, str)  # csv_file, output_dir
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SCORM Wrapper Wizard v0.3")
-        self.setFixedSize(600, 500)
+        self.setWindowTitle("SCORM Wrapper Wizard v0.4")
+        self.setFixedSize(600, 550)  # Increased height for error labels
         
         # Variables
         self.video_type = "vimeo"
@@ -33,12 +35,29 @@ class SCORMWizard(QMainWindow):
         self.title_text = ""
         self.description_text = ""
         self.local_file_path = ""
+        self.subtitle_file_path = ""
         self.batch_mode = False
+        self.config = Config()
+        
+        # Validation state
+        self.validation_errors = {
+            'title': '',
+            'video': ''
+        }
         
         self.setup_ui()
         
         # Imposta sempre i tooltip
         self._setup_tooltips()
+        
+        # Setup keyboard shortcuts
+        self._setup_shortcuts()
+        
+        # Load saved preferences
+        self._load_preferences()
+        
+        # Setup real-time validation
+        self._setup_validation()
         
     def setup_ui(self):
         """Configura l'interfaccia utente"""
@@ -114,6 +133,11 @@ class SCORMWizard(QMainWindow):
         self.video_source_frame = video_frame
         
         # Video URL/ID Input
+        url_container = QWidget()
+        url_container_layout = QVBoxLayout(url_container)
+        url_container_layout.setContentsMargins(0, 0, 0, 0)
+        url_container_layout.setSpacing(2)
+        
         url_layout = QHBoxLayout()
         self.url_label = QLabel("Vimeo Video ID:")
         url_layout.addWidget(self.url_label)
@@ -125,16 +149,37 @@ class SCORMWizard(QMainWindow):
         self.browse_btn.clicked.connect(self.browse_file)
         self.browse_btn.hide()  # Hide initially
         url_layout.addWidget(self.browse_btn)
-        main_layout.addLayout(url_layout)
+        url_container_layout.addLayout(url_layout)
+        
+        # Error label for video input
+        self.video_error_label = QLabel("")
+        self.video_error_label.setStyleSheet("color: red; font-size: 9px;")
+        self.video_error_label.setWordWrap(True)
+        url_container_layout.addWidget(self.video_error_label)
+        
+        main_layout.addWidget(url_container)
         
         # Title Input
+        title_container = QWidget()
+        title_container_layout = QVBoxLayout(title_container)
+        title_container_layout.setContentsMargins(0, 0, 0, 0)
+        title_container_layout.setSpacing(2)
+        
         title_layout = QHBoxLayout()
         title_label = QLabel("Title:")
         title_label.setFont(video_type_font)
         title_layout.addWidget(title_label)
         self.title_entry = QLineEdit()
         title_layout.addWidget(self.title_entry)
-        main_layout.addLayout(title_layout)
+        title_container_layout.addLayout(title_layout)
+        
+        # Error label for title
+        self.title_error_label = QLabel("")
+        self.title_error_label.setStyleSheet("color: red; font-size: 9px;")
+        self.title_error_label.setWordWrap(True)
+        title_container_layout.addWidget(self.title_error_label)
+        
+        main_layout.addWidget(title_container)
         
         # Riferimenti ai widget per i tooltip
         self.title_label_widget = title_label
@@ -152,6 +197,19 @@ class SCORMWizard(QMainWindow):
         # Riferimenti ai widget per i tooltip
         self.description_label_widget = desc_label
         
+        # Subtitle Input (optional)
+        subtitle_layout = QHBoxLayout()
+        subtitle_label = QLabel("Subtitle File (optional):")
+        subtitle_label.setFont(video_type_font)
+        subtitle_layout.addWidget(subtitle_label)
+        self.subtitle_entry = QLineEdit()
+        self.subtitle_entry.setEnabled(False)
+        subtitle_layout.addWidget(self.subtitle_entry)
+        self.subtitle_browse_btn = QPushButton("Browse")
+        self.subtitle_browse_btn.clicked.connect(self.browse_subtitle_file)
+        subtitle_layout.addWidget(self.subtitle_browse_btn)
+        main_layout.addLayout(subtitle_layout)
+        
         # Help text
         help_text = "For Vimeo/YouTube: Enter video ID only\nFor Remote URL: Enter full video URL\nFor Local File: Click Browse to select"
         help_label = QLabel(help_text)
@@ -163,6 +221,7 @@ class SCORMWizard(QMainWindow):
         # Generate Button
         self.generate_btn = QPushButton("Generate SCORM Package")
         self.generate_btn.clicked.connect(self.on_generate_clicked)
+        self.generate_btn.setEnabled(False)  # Disabled until valid
         main_layout.addWidget(self.generate_btn)
         
         # Progress bar (initially hidden)
@@ -183,7 +242,7 @@ class SCORMWizard(QMainWindow):
         self.batch_btn = QPushButton("Batch Mode")
         self.batch_btn.clicked.connect(self.toggle_batch_mode)
         self.batch_btn.setParent(central_widget)
-        self.batch_btn.setGeometry(450, 450, 130, 30)
+        self.batch_btn.setGeometry(450, 500, 130, 30)
     
     def _setup_tooltips(self):
         """Imposta sempre i tooltip sui widget per la modalità single"""
@@ -304,6 +363,99 @@ class SCORMWizard(QMainWindow):
         
         help_dialog.exec()
     
+    def _setup_validation(self):
+        """Setup real-time validation for input fields."""
+        self.title_entry.textChanged.connect(self._validate_title)
+        self.url_entry.textChanged.connect(self._validate_video_input)
+        self.desc_text.textChanged.connect(self._validate_form)
+        # Initial validation
+        self._validate_form()
+    
+    def _setup_shortcuts(self):
+        """Setup keyboard shortcuts."""
+        # Ctrl+G: Generate
+        QShortcut(QKeySequence("Ctrl+G"), self, self.on_generate_clicked)
+        # Ctrl+B: Toggle batch mode
+        QShortcut(QKeySequence("Ctrl+B"), self, self.toggle_batch_mode)
+        # F1: Help
+        QShortcut(QKeySequence("F1"), self, self.show_help_modal)
+        # Enter: Submit (when form is valid)
+        enter_shortcut = QShortcut(QKeySequence("Return"), self)
+        enter_shortcut.activated.connect(lambda: self.on_generate_clicked() if self.generate_btn.isEnabled() else None)
+    
+    def _load_preferences(self):
+        """Load saved user preferences."""
+        # Load last video type
+        last_type = self.config.get_last_video_type()
+        if last_type == "youtube":
+            self.youtube_radio.setChecked(True)
+            self.on_video_type_change()
+        elif last_type == "videojs":
+            self.remote_radio.setChecked(True)
+            self.on_video_type_change()
+        elif last_type == "local":
+            self.local_radio.setChecked(True)
+            self.on_video_type_change()
+    
+    def _validate_title(self):
+        """Validate title field."""
+        title = self.title_entry.text().strip()
+        if not title:
+            self.validation_errors['title'] = "Title is required"
+            self._show_field_error(self.title_entry, self.title_error_label, "Title is required")
+        else:
+            self.validation_errors['title'] = ''
+            self._clear_field_error(self.title_entry, self.title_error_label)
+        self._validate_form()
+    
+    def _validate_video_input(self):
+        """Validate video input field."""
+        video_input = self.url_entry.text().strip()
+        error = ''
+        
+        if self.video_type == "local":
+            if not self.local_file_path or not os.path.exists(self.local_file_path):
+                error = "Please select a valid video file"
+        else:
+            if not video_input:
+                error = "Please provide video ID/URL"
+            elif self.video_type == "vimeo":
+                # Vimeo ID should be numeric or extractable from URL
+                if not video_input.isdigit() and "vimeo.com" not in video_input.lower():
+                    error = "Invalid Vimeo ID. Expected format: 123456789 or vimeo.com/123456789"
+            elif self.video_type == "youtube":
+                # YouTube ID should be 11 chars or extractable from URL
+                if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_input) and "youtube.com" not in video_input.lower() and "youtu.be" not in video_input.lower():
+                    error = "Invalid YouTube ID. Expected format: abc123def45 or youtube.com/watch?v=abc123def45"
+            elif self.video_type == "videojs":
+                # Remote URL should start with http:// or https://
+                if not video_input.startswith(("http://", "https://")):
+                    error = "Invalid URL. Must start with http:// or https://"
+        
+        self.validation_errors['video'] = error
+        if error:
+            self._show_field_error(self.url_entry, self.video_error_label, error)
+        else:
+            self._clear_field_error(self.url_entry, self.video_error_label)
+        self._validate_form()
+    
+    def _validate_form(self):
+        """Validate entire form and enable/disable generate button."""
+        is_valid = not any(self.validation_errors.values())
+        self.generate_btn.setEnabled(is_valid)
+    
+    def _show_field_error(self, field, error_label, message):
+        """Show error styling on field and error message."""
+        field.setStyleSheet("border: 2px solid red;")
+        error_label.setText(message)
+        error_label.show()
+    
+    def _clear_field_error(self, field, error_label):
+        """Clear error styling from field."""
+        field.setStyleSheet("")
+        error_label.setText("")
+        error_label.hide()
+    
     def _update_video_input_tooltip(self):
         """Aggiorna il tooltip del campo input video in base al tipo selezionato"""
         if self.video_type == "vimeo" or self.video_type == "youtube":
@@ -340,8 +492,14 @@ class SCORMWizard(QMainWindow):
             self.browse_btn.show()
             self.url_entry.setEnabled(False)
         
+        # Save preference
+        self.config.set_last_video_type(self.video_type)
+        
         # Aggiorna il tooltip del campo input in base al nuovo tipo
         self._update_video_input_tooltip()
+        
+        # Re-validate video input
+        self._validate_video_input()
     
     def browse_file(self):
         """Apre il dialog per selezionare un file video"""
@@ -354,24 +512,46 @@ class SCORMWizard(QMainWindow):
         if filename:
             self.local_file_path = filename
             self.url_entry.setText(os.path.basename(filename))
+            self._validate_video_input()
+    
+    def browse_subtitle_file(self):
+        """Apre il dialog per selezionare un file subtitle"""
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Subtitle File",
+            "",
+            "Subtitle files (*.srt *.vtt);;SRT files (*.srt);;VTT files (*.vtt);;All files (*.*)"
+        )
+        if filename:
+            self.subtitle_file_path = filename
+            self.subtitle_entry.setText(os.path.basename(filename))
+            self.subtitle_entry.setEnabled(True)
     
     def on_generate_clicked(self):
         """Gestisce il click sul pulsante Generate"""
+        # Validate form first
+        if not self.generate_btn.isEnabled():
+            return
+        
         # La validazione e la generazione saranno gestite dal main.py
         # che connetterà i signals
         title = self.title_entry.text().strip()
         description = self.desc_text.toPlainText().strip()
         video_input = self.url_entry.text().strip()
         
-        # Chiedi directory di output
-        output_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        # Chiedi directory di output (use last directory if available)
+        last_dir = self.config.get_last_output_dir()
+        output_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory", last_dir)
         if not output_dir:
             return
+        
+        # Save output directory preference
+        self.config.set_last_output_dir(output_dir)
         
         # Emetti signal per richiedere la generazione
         self.generate_requested.emit(
             title, description, self.video_type, video_input,
-            self.local_file_path, output_dir
+            self.local_file_path, self.subtitle_file_path, output_dir
         )
     
     def handle_file_conflict(self, file_path, batch_mode=False, apply_to_all=None):
@@ -578,16 +758,17 @@ class SCORMWizard(QMainWindow):
         batch_layout.addLayout(title_layout)
         
         # Instructions
-        instructions = """CSV Format Columns (Headers): title, description, path_or_url:
+        instructions = """CSV Format Columns (Headers): title, description, path_or_url, subtitle_path:
 - title: Course title (will be used as ZIP filename)
 - description: Course description
 - path_or_url: Windows path to local file OR complete URL (Vimeo, YouTube, or remote file)
+- subtitle_path: (Optional) Path to subtitle file (.srt or .vtt)
 
 Example:
-title,description,path_or_url
-My Course,This is a course,C:\\videos\\video.mp4
-Vimeo Course,Another course,https://vimeo.com/123456789
-YouTube Course,Yet another,https://www.youtube.com/watch?v=abc123"""
+title,description,path_or_url,subtitle_path
+My Course,This is a course,C:\\videos\\video.mp4,C:\\subtitles\\subtitles.srt
+Vimeo Course,Another course,https://vimeo.com/123456789,
+YouTube Course,Yet another,https://www.youtube.com/watch?v=abc123,C:\\subtitles\\youtube_subtitles.vtt"""
         
         instructions_label = QLabel(instructions)
         instructions_font = QFont("Arial", 9)
@@ -627,6 +808,12 @@ YouTube Course,Yet another,https://www.youtube.com/watch?v=abc123"""
         self.process_btn = QPushButton("▶ Process Batch")
         self.process_btn.clicked.connect(self.on_process_batch_clicked)
         batch_layout.addWidget(self.process_btn)
+        
+        # Cancel button (initially hidden)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.on_cancel_batch)
+        self.cancel_btn.hide()
+        batch_layout.addWidget(self.cancel_btn)
         
         # Progress bar (initially hidden)
         self.progress_bar = QProgressBar()
@@ -711,10 +898,79 @@ YouTube Course,Yet another,https://www.youtube.com/watch?v=abc123"""
             self.progress_bar.setValue(percentage)
         self.batch_status.setText(message)
     
-    def show_success(self, message: str, window=None):
-        """Mostra un messaggio di successo"""
+    def show_success(self, message: str, window=None, output_path=None):
+        """Mostra un messaggio di successo con opzione per aprire la cartella e validare"""
         target_window = window if window else self
-        QMessageBox.information(target_window, "Success", message)
+        
+        msg_box = QMessageBox(target_window)
+        msg_box.setWindowTitle("Success")
+        msg_box.setText(message)
+        msg_box.setIcon(QMessageBox.Icon.Information)
+        
+        # Add "Open Folder" button if output path is provided
+        if output_path:
+            open_folder_btn = msg_box.addButton("Open Folder", QMessageBox.ButtonRole.ActionRole)
+            open_folder_btn.clicked.connect(lambda: self._open_output_folder(output_path))
+            
+            # Add "Validate Package" button
+            validate_btn = msg_box.addButton("Validate Package", QMessageBox.ButtonRole.ActionRole)
+            validate_btn.clicked.connect(lambda: self._validate_package(output_path, msg_box))
+        
+        msg_box.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+        msg_box.exec()
+    
+    def _validate_package(self, zip_path: str, parent_msg_box=None):
+        """Validate the generated SCORM package."""
+        from scorm_validator import SCORMValidator
+        
+        validator = SCORMValidator()
+        is_valid, errors, warnings = validator.validate_package(zip_path)
+        report = validator.get_validation_report(zip_path)
+        
+        # Close parent message box if provided
+        if parent_msg_box:
+            parent_msg_box.close()
+        
+        # Show validation results
+        validation_dialog = QDialog(self)
+        validation_dialog.setWindowTitle("Package Validation")
+        validation_dialog.setFixedSize(600, 400)
+        
+        layout = QVBoxLayout(validation_dialog)
+        
+        # Status label
+        status_label = QLabel("✓ VALID" if is_valid else "✗ INVALID")
+        status_font = QFont("Arial", 14, QFont.Bold)
+        status_label.setFont(status_font)
+        if is_valid:
+            status_label.setStyleSheet("color: green;")
+        else:
+            status_label.setStyleSheet("color: red;")
+        layout.addWidget(status_label)
+        
+        # Report text
+        report_text = QTextEdit()
+        report_text.setReadOnly(True)
+        report_text.setPlainText(report)
+        layout.addWidget(report_text)
+        
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(validation_dialog.accept)
+        layout.addWidget(close_btn)
+        
+        validation_dialog.exec()
+    
+    def _open_output_folder(self, file_path):
+        """Open the folder containing the output file."""
+        import subprocess
+        from pathlib import Path
+        
+        folder_path = Path(file_path).parent
+        if os.name == 'nt':  # Windows
+            subprocess.Popen(f'explorer "{folder_path}"')
+        elif os.name == 'posix':  # Linux/Mac
+            subprocess.Popen(['xdg-open', str(folder_path)])
     
     def show_error(self, message: str, window=None):
         """Mostra un messaggio di errore"""
@@ -736,6 +992,13 @@ YouTube Course,Yet another,https://www.youtube.com/watch?v=abc123"""
             self.process_btn.setText("Processing...")
             self.progress_bar.show()
             self.progress_bar.setValue(0)
+            self.cancel_btn.show()
         else:
             self.process_btn.setText("▶ Process Batch")
             self.progress_bar.hide()
+            self.cancel_btn.hide()
+    
+    def on_cancel_batch(self):
+        """Handle cancel button click for batch processing."""
+        # This will be connected from main.py
+        pass

@@ -5,12 +5,376 @@ Contiene tutte le funzioni di business logic separate dalla GUI.
 import os
 import re
 import csv
+import shutil
+import zipfile
+import xml.etree.ElementTree as ET
+import uuid
+import sys
 from pathlib import Path
 from io import StringIO
 from typing import Optional, Tuple, List, Dict
 from PySide6.QtCore import QObject, Signal  # type: ignore
 
-from scorm_generator import SCORMGenerator
+
+def _get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = Path(sys._MEIPASS)
+    except Exception:
+        # Running as script, use current directory
+        base_path = Path(__file__).parent
+    
+    return base_path / relative_path
+
+
+class SCORMGenerator:
+    """Generates SCORM 1.2 packages."""
+    
+    def __init__(self):
+        self.template_dir = _get_resource_path("working_scorm_zip_example")
+        if not self.template_dir.exists():
+            raise FileNotFoundError(f"Template directory 'working_scorm_zip_example' not found at {self.template_dir}!")
+    
+    def generate(self, title, description, video_type, video_url, local_video_file=None, 
+                 subtitle_file=None, output_dir=".", output_filename=None):
+        """
+        Generate a SCORM 1.2 package
+        
+        Args:
+            title: Course title (required)
+            description: Course description (optional)
+            video_type: "vimeo", "youtube", "videojs", or "local"
+            video_url: Video ID or URL depending on type
+            local_video_file: Path to local video file (if video_type is "local")
+            subtitle_file: Path to subtitle file (.srt or .vtt) (optional)
+            output_dir: Directory to save the SCORM package
+            output_filename: Optional custom filename for the ZIP file (if None, uses sanitized title)
+        
+        Returns:
+            Path to the generated ZIP file
+        """
+        # Create temporary directory for package
+        package_name = self.sanitize_filename(title)
+        temp_dir = Path(output_dir) / f"scorm_temp_{uuid.uuid4().hex[:8]}"
+        package_dir = temp_dir / package_name
+        
+        try:
+            # Copy template files
+            self._copy_template_files(package_dir)
+            
+            # Copy local video file if provided
+            if video_type == "local" and local_video_file:
+                shutil.copy2(local_video_file, package_dir / os.path.basename(local_video_file))
+            
+            # Copy subtitle file if provided
+            subtitle_filename = None
+            if subtitle_file and os.path.exists(subtitle_file):
+                subtitle_filename = os.path.basename(subtitle_file)
+                shutil.copy2(subtitle_file, package_dir / subtitle_filename)
+            
+            # Generate config.js
+            self._generate_config(package_dir, video_type, video_url, subtitle_filename)
+            
+            # Generate imsmanifest.xml
+            self._generate_manifest(package_dir, title, description)
+            
+            # Generate index.html
+            self._generate_index_html(package_dir, title, description, video_type, subtitle_filename)
+            
+            # Create ZIP file - use custom filename if provided, otherwise use default
+            if output_filename:
+                zip_path = Path(output_filename)
+            else:
+                zip_path = Path(output_dir) / f"{package_name}.zip"
+            self._create_zip(package_dir, zip_path)
+            
+            return str(zip_path)
+            
+        finally:
+            # Clean up temporary directory
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+    
+    def sanitize_filename(self, filename):
+        """Sanitize filename for filesystem"""
+        # Remove invalid characters
+        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        # Remove leading/trailing spaces and dots
+        filename = filename.strip(' .')
+        return filename or "scorm_package"
+    
+    def _copy_template_files(self, package_dir):
+        """Copy all template files from working example"""
+        package_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Copy all files and directories
+        for item in self.template_dir.iterdir():
+            if item.is_file():
+                # Skip config.js and imsmanifest.xml as we'll generate them
+                if item.name not in ['config.js', 'imsmanifest.xml', 'index.html']:
+                    shutil.copy2(item, package_dir / item.name)
+            elif item.is_dir():
+                shutil.copytree(item, package_dir / item.name, dirs_exist_ok=True)
+    
+    def _generate_config(self, package_dir, video_type, video_url, subtitle_filename=None):
+        """Generate config.js file"""
+        # Map video_type to playerType
+        player_type_map = {
+            "vimeo": "vimeo",
+            "youtube": "youtube",
+            "videojs": "videojs",
+            "local": "videojs"
+        }
+        
+        player_type = player_type_map.get(video_type, "videojs")
+        
+        # Generate tracks array if subtitle file exists
+        # Note: Tracks only work with VideoJS player (local and remote URLs)
+        # Vimeo and YouTube have their own subtitle systems
+        tracks_content = ""
+        if subtitle_filename and player_type == "videojs":
+            # Determine kind based on file extension
+            kind = "subtitles"
+            srclang = "en"  # Default language, could be extracted from filename
+            label = "English"  # Default label
+            
+            # Try to extract language from filename (e.g., subtitles.en.srt)
+            lang_match = re.search(r'\.([a-z]{2})\.(srt|vtt)$', subtitle_filename.lower())
+            if lang_match:
+                srclang = lang_match.group(1)
+                label = srclang.upper()
+            
+            # Escape the filename for JavaScript
+            subtitle_filename_escaped = subtitle_filename.replace('\\', '/').replace('"', '\\"')
+            
+            tracks_content = f"""
+        {{
+            src: "{subtitle_filename_escaped}",
+            kind: "{kind}",
+            srclang: "{srclang}",
+            label: "{label}",
+            default: true
+        }}"""
+        
+        config_content = f"""var videoall_config = {{
+    // Tracking mode is:
+    // "none" for no tracking
+    // "scorm12" for SCORM 1.2
+    // "scorm2004" for SCORM 2004
+    // "xapi" for Tin Can/XAPI
+    trackingMode: "scorm12",
+    // Player type can be:
+    // "youtube" for Youtube videos.  "url" is the ID of the Youtube video.
+    // "vimeo" for Vimeo videos.  "url" is the ID of the Vimeo video.
+    // "videojs" for local videos.  "url" is a URL to the video, relative or absolute.
+    playerType: "{player_type}",
+    width: "100%",
+    height: "100%",
+    url: "{video_url}",
+    
+    autoplay: true,
+    seekModeIncomplete: "ONLY_BACKWARD", // NONE, ANYWHERE, ONLY_BACKWARD
+    seekModeCompleted: "ANYWHERE", // NONE, ANYWHERE, ONLY_BACKWARD
+    bookmarkQuestion: "Would you like to return to your bookmark?",
+    bookmarkForceResume: true,
+    completionBy: "END", // END, PERCENT_WATCHED
+    completionFraction: 1,
+    completeFn: function() {{
+        // console.log("Perform custom completion activities here.");
+    }},
+    tracks: [{tracks_content}
+    ],
+    poster: ""
+}};
+"""
+        with open(package_dir / "config.js", "w", encoding="utf-8") as f:
+            f.write(config_content)
+    
+    def _generate_manifest(self, package_dir, title, description):
+        """Generate imsmanifest.xml file"""
+        # Escape XML special characters
+        def escape_xml(text):
+            if not text:
+                return ""
+            return (text.replace("&", "&amp;")
+                       .replace("<", "&lt;")
+                       .replace(">", "&gt;")
+                       .replace('"', "&quot;")
+                       .replace("'", "&apos;"))
+        
+        title_escaped = escape_xml(title)
+        
+        manifest_content = f'''<manifest identifier="ssv" version="3.0.2" xmlns="http://www.imsproject.org/xsd/imscp_rootv1p1p2" xmlns:adlcp="http://www.adlnet.org/xsd/adlcp_rootv1p2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.imsproject.org/xsd/imscp_rootv1p1p2 imscp_rootv1p1p2.xsd
+http://www.imsglobal.org/xsd/imsmd_rootv1p2p1 imsmd_rootv1p2p1.xsd
+http://www.adlnet.org/xsd/adlcp_rootv1p2 adlcp_rootv1p2.xsd">
+	<metadata>
+		<schema>ADL SCORM</schema>
+		<schemaversion>1.2</schemaversion>
+	</metadata>
+	<organizations default="JCA">
+		<organization identifier="JCA">
+			<title>{title_escaped}</title>
+			<item identifier="quiz1" identifierref="testerf" isvisible="true">
+				<title>{title_escaped}</title>
+			</item>
+		</organization>
+	</organizations>
+	<resources>
+		<resource adlcp:scormtype="sco" identifier="testerf" type="webcontent" href="index.html">
+		</resource>
+	</resources>
+</manifest>'''
+        
+        with open(package_dir / "imsmanifest.xml", "w", encoding="utf-8") as f:
+            f.write(manifest_content)
+    
+    def _generate_index_html(self, package_dir, title, description, video_type="videojs", subtitle_filename=None):
+        """Generate index.html file"""
+        # Escape HTML special characters
+        def escape_html(text):
+            if not text:
+                return ""
+            return (text.replace("&", "&amp;")
+                       .replace("<", "&lt;")
+                       .replace(">", "&gt;")
+                       .replace('"', "&quot;")
+                       .replace("'", "&#x27;"))
+        
+        title_escaped = escape_html(title)
+        desc_escaped = escape_html(description)
+        
+        # Add script to manually add tracks for VideoJS players if subtitle exists
+        # This is a fallback in case the compiled main.js doesn't handle tracks from config
+        tracks_script = ""
+        if subtitle_filename and video_type in ["videojs", "local"]:
+            # Determine language from filename
+            srclang = "en"
+            label = "English"
+            lang_match = re.search(r'\.([a-z]{2})\.(srt|vtt)$', subtitle_filename.lower())
+            if lang_match:
+                srclang = lang_match.group(1)
+                label = srclang.upper()
+            
+            subtitle_filename_escaped = escape_html(subtitle_filename)
+            # Escape for JavaScript string
+            subtitle_filename_js = subtitle_filename.replace('\\', '/').replace('"', '\\"')
+            tracks_script = f"""
+        // Manually add subtitle tracks for VideoJS player as fallback
+        // This ensures tracks are added even if main.js doesn't handle config.tracks
+        (function() {{
+            function addTracksToPlayer() {{
+                try {{
+                    // Try to get player from videoall object
+                    var player = null;
+                    if (typeof ssv !== 'undefined' && ssv.videoall) {{
+                        var playerType = ssv.videoall.config && ssv.videoall.config.playerType;
+                        if (playerType === 'videojs' && ssv.videoall.videojs) {{
+                            player = ssv.videoall.videojs.player || ssv.videoall.videojs;
+                        }}
+                    }}
+                    
+                    // If player not found, try to find VideoJS player by ID
+                    if (!player && typeof videojs !== 'undefined') {{
+                        var players = videojs.getPlayers();
+                        for (var id in players) {{
+                            player = players[id];
+                            break;
+                        }}
+                    }}
+                    
+                    if (player && typeof player.addRemoteTextTrack === 'function') {{
+                        // Check if track already exists
+                        var tracks = player.textTracks();
+                        var trackExists = false;
+                        for (var i = 0; i < tracks.length; i++) {{
+                            if (tracks[i].src && tracks[i].src.indexOf("{subtitle_filename_js}") !== -1) {{
+                                trackExists = true;
+                                break;
+                            }}
+                        }}
+                        
+                        if (!trackExists) {{
+                            player.addRemoteTextTrack({{
+                                src: "{subtitle_filename_js}",
+                                kind: "subtitles",
+                                srclang: "{srclang}",
+                                label: "{label}",
+                                default: true
+                            }}, true);
+                        }}
+                    }}
+                }} catch(e) {{
+                    console.log('Error adding subtitle tracks:', e);
+                }}
+            }}
+            
+            // Try immediately
+            addTracksToPlayer();
+            
+            // Try after player initialization (with delays)
+            setTimeout(addTracksToPlayer, 500);
+            setTimeout(addTracksToPlayer, 1500);
+            setTimeout(addTracksToPlayer, 3000);
+        }})();"""
+        
+        html_content = f'''<!DOCTYPE html>
+<html>
+<head>
+    <link href="js/3rd/videojs/video-js.css" rel="stylesheet">
+    <link href="css/style.css" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script type="text/javascript">
+        document.createElement('video');
+        document.createElement('audio');
+        document.createElement('track');
+    </script>
+    <script src="js/3rd/videojs/video.js"></script>
+    <script>
+        videojs.options.techOrder = ['html5'];
+    </script>
+    <script type="text/javascript" src="js/3rd/xapiwrapper.min.js"></script>
+    <script type="text/javascript" src="config.js"></script>
+    <script type="text/javascript" src="js/main.js"></script>
+</head>
+<body onbeforeunload="ssv.videoall.updateBookmark()">
+<div id="bookmarkAlert" class="modal" style="display: none">
+    <div class="modal-content">
+        <h3>Bookmark Detected</h3>
+        <p id="bookmarkQuestion">...</p>
+        <button id="bookmarkYes">Yes</button>
+        <button id="bookmarkNo">No</button>
+    </div>
+</div>
+<div id="container">
+    <div id="player"></div>
+    <div id="titlebox">
+        <div style="flex-grow: 10; padding: 10px;">
+            {title_escaped}
+            <br/>
+            <div class="desc" style="font-weight:normal;">{desc_escaped}</div>
+            
+        </div>
+    </div>
+</div>
+    <script>
+        document.getElementById('titlebox').style.width = ssv.videoall.config.width + 'px';
+        document.addEventListener('contextmenu', event => event.preventDefault());{tracks_script}
+    </script>
+</body>
+</html>'''
+        
+        with open(package_dir / "index.html", "w", encoding="utf-8") as f:
+            f.write(html_content)
+    
+    def _create_zip(self, package_dir, zip_path):
+        """Create ZIP file from package directory"""
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(package_dir):
+                for file in files:
+                    file_path = Path(root) / file
+                    arcname = file_path.relative_to(package_dir)
+                    zipf.write(file_path, arcname)
 
 
 class SCORMLogic(QObject):
@@ -148,7 +512,8 @@ class SCORMLogic(QObject):
     
     def generate_scorm_package(self, title: str, description: str, video_type: str,
                                video_url: str, local_video_file: Optional[str],
-                               output_dir: str, output_filename: Optional[str] = None) -> str:
+                               output_dir: str, output_filename: Optional[str] = None,
+                               subtitle_file: Optional[str] = None) -> str:
         """
         Genera un pacchetto SCORM.
         
@@ -160,6 +525,7 @@ class SCORMLogic(QObject):
             local_video_file: Path del file video locale (se applicabile)
             output_dir: Directory di output
             output_filename: Nome file personalizzato (opzionale)
+            subtitle_file: Path del file subtitle (opzionale)
         
         Returns:
             Path del file ZIP generato
@@ -181,6 +547,7 @@ class SCORMLogic(QObject):
             video_type=video_type,
             video_url=video_url,
             local_video_file=local_video_file,
+            subtitle_file=subtitle_file,
             output_dir=output_dir,
             output_filename=output_filename
         )
@@ -297,6 +664,8 @@ class SCORMLogic(QObject):
                 description = get_field(row, 'description')
                 path_or_url = get_field(row, 'path_or_url', 
                                        ['path_or_url', 'path', 'url', 'video_path', 'video_url'])
+                subtitle_path = get_field(row, 'subtitle_path', 
+                                         ['subtitle_path', 'subtitle', 'subtitle_file', 'srt', 'vtt'])
                 
                 if not title:
                     errors.append(f"Row {row_num}: Missing title")
@@ -353,12 +722,22 @@ class SCORMLogic(QObject):
                         errors.append(f"Row {row_num}: File already exists (skipped): {output_file}")
                         continue
                 
+                # Validate subtitle file if provided
+                subtitle_file = None
+                if subtitle_path:
+                    if os.path.exists(subtitle_path):
+                        subtitle_file = subtitle_path
+                    else:
+                        errors.append(f"Row {row_num}: Subtitle file not found: {subtitle_path}")
+                        # Continue without subtitle
+                
                 output_path = self.generator.generate(
                     title=title,
                     description=description,
                     video_type=video_type,
                     video_url=video_url,
                     local_video_file=local_file,
+                    subtitle_file=subtitle_file,
                     output_dir=output_dir,
                     output_filename=final_path
                 )
